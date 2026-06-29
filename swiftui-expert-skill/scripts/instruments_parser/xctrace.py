@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -103,13 +108,31 @@ def export_schema(trace_path: Path, schema: str, run: int = 1) -> bytes:
 
 def _run_export(trace_path: Path, extra_args: list[str]) -> bytes:
     cmd = ["xctrace", "export", "--input", str(trace_path), *extra_args]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"xctrace export failed ({proc.returncode}): "
-            f"{proc.stderr.decode(errors='replace').strip()}"
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        proc = subprocess.run(cmd, capture_output=True, check=False)
+
+        if proc.returncode == 0:
+            return proc.stdout
+
+        # Only retry on crash signals (e.g. SIGSEGV = -11).
+        # Regular non-zero exit codes are deterministic failures.
+        is_crash = proc.returncode < 0
+        if not is_crash or attempt == _MAX_RETRIES:
+            raise RuntimeError(
+                f"xctrace export failed ({proc.returncode}): "
+                f"{proc.stderr.decode(errors='replace').strip()}"
+            )
+
+        delay = _RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+        print(
+            f"xctrace export crashed (signal {-proc.returncode}); "
+            f"retry {attempt}/{_MAX_RETRIES - 1} in {delay:.0f}s…",
+            file=sys.stderr,
         )
-    return proc.stdout
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _find_text(root: ET.Element, path: str) -> str | None:
